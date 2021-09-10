@@ -30,7 +30,11 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
-import openmm
+try:
+    import openmm
+except (ModuleNotFoundError, ImportError):
+    from simtk import openmm
+
 from typing import Iterable, Optional
 
 class ANIPotentialImplFactory(MLPotentialImplFactory):

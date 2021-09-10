@@ -28,9 +28,11 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
-
-import openmm
-import openmm.app
+try:
+    import openmm
+    import openmm.app
+except (ImportError, ModuleNotFoundError):
+    from simtk import openmm
 from typing import Dict, Iterable, Optional
 
 
