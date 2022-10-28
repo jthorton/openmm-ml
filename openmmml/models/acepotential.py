@@ -1,5 +1,3 @@
-import numpy
-
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
 import openmm
 from typing import Optional, Iterable
@@ -38,13 +36,13 @@ class MACEPotentialImpl(MLPotentialImpl):
         import torch
         import openmmtorch
         from mace.data.utils import Configuration, AtomicNumberTable
-        from mace.calculators.neighbour_list_torch import primitive_neighbor_list_torch
         from mace.tools.torch_geometric import DataLoader
-        from mace.tools import to_one_hot, atomic_numbers_to_indices
         from mace.data import AtomicData
         from e3nn.util import jit
         import numpy as np
         from torch_nl import compute_neighborlist
+
+        torch.set_default_dtype(torch.float64)
 
         # load the mace model
         model = torch.load(self.model_path)
@@ -54,17 +52,38 @@ class MACEPotentialImpl(MLPotentialImpl):
         if atoms is not None:
             target_atoms = [target_atoms[i] for i in atoms]
         atomic_numbers = np.array([atom.element.atomic_number for atom in target_atoms])
-        indices = atomic_numbers_to_indices(atomic_numbers=atomic_numbers, z_table=z_table)
-        one_hot = to_one_hot(
-            torch.tensor(indices, dtype=torch.long).unsqueeze(-1),
-            num_classes=len(z_table),
-        )
         is_periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
+
+        if is_periodic:
+            pbc = (True, True, True)
+        else:
+            pbc = (False, False, False)
+
+        config = Configuration(
+            atomic_numbers=atomic_numbers,
+            positions=np.zeros((len(atomic_numbers), 3)),
+            pbc=pbc,
+            cell=np.zeros((3, 3)),
+            weight=1
+        )
+        data_loader = DataLoader(dataset=[AtomicData.from_config(config, z_table=z_table, cutoff=model.r_max)],
+            batch_size=1,
+            shuffle=False,
+            drop_last=False,
+        )
+        input_dict = next(iter(data_loader)).to_dict()
+        input_dict.pop("edge_index")
+        input_dict.pop("energy", None)
+        input_dict.pop("forces", None)
+        input_dict.pop("positions")
+        input_dict.pop("shifts")
+        input_dict.pop("weight")
+
 
         class MACEForce(torch.nn.Module):
             """A wrapper around a MACe model which can be called by openmm-torch"""
 
-            def __init__(self, model, node_attrs, atoms, periodic):
+            def __init__(self, model, input_data, atoms, periodic):
                 """
                 Args:
                     model:
@@ -79,7 +98,7 @@ class MACEPotentialImpl(MLPotentialImpl):
 
                 super(MACEForce, self).__init__()
                 self.model = model
-                self.node_attrs = node_attrs
+                self.input_dict = input_data
                 if atoms is None:
                     self.indices = None
                 else:
@@ -106,25 +125,19 @@ class MACEPotentialImpl(MLPotentialImpl):
                         The forces on each atom in (KJ/mol/nm)
                 """
                 # MACE expects inputs in Angstroms
-
                 # create a config for the model
-                positions = positions.to(torch.float32)
+                positions = positions.to(torch.float64)
                 # if we are only modeling a subsection select those positions
                 if self.indices is not None:
                     positions = positions[self.indices]
+                positions = 10.0*positions
 
                 if boxvectors is None:
-                    cell = torch.tensor([[100.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]], requires_grad=False)
+                    cell = torch.tensor([[100.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]], requires_grad=False, dtype=torch.float64)
                 else:
+                    boxvectors = boxvectors.to(torch.float64)
                     cell = 10.0*boxvectors
 
-                # config = Configuration(
-                #     atomic_numbers=self.species.numpy(),
-                #     positions=10.0*positions,
-                #     pbc=self.pbc,
-                #     cell=cell,
-                #     weight=1
-                # )
                 # pass through the model
                 mapping, batch_mapping, shifts_idx = compute_neighborlist(
                     cutoff=self.model.r_max,
@@ -145,21 +158,17 @@ class MACEPotentialImpl(MLPotentialImpl):
                 shifts_idx = shifts_idx[keep_edge]
 
                 edge_index = torch.stack((sender, receiver))
-                input_data = {
-                    "positions": positions,
-                    "edge_index": edge_index,
-                    "node_attrs": self.node_attrs,
-                    "cell": cell
-                }
+                inp_dict_this_config = self.input_dict.copy()
+                inp_dict_this_config["positions"] = positions
+                inp_dict_this_config["edge_index"] = edge_index
+                inp_dict_this_config["shifts"] = shifts_idx
+                inp_dict_this_config["cell"] = cell
+
+                res = self.model(inp_dict_this_config, compute_force=True)
+                return 96.486*res["energy"]
 
 
-                # inp_dict_this_config["shifts"] = shifts
-                # inp_dict_this_config[""] =
-                res = self.model(input_data)
-                # return res["energy"] * 96.486, res["forces"] * 964.86
-                return res["energy"], res["forces"]
-
-        mace_force = MACEForce(model=model, node_attrs=one_hot, atoms=atoms, periodic=is_periodic)
+        mace_force = MACEForce(model=model, input_data=input_dict, atoms=atoms, periodic=is_periodic)
 
         # convert using jit
         module = jit.script(mace_force)
@@ -170,7 +179,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         force = openmmtorch.TorchForce(filename)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(is_periodic)
-        force.setOutputsForces(True)
+        # force.setOutputsForces(True)
         system.addForce(force)
 
 
